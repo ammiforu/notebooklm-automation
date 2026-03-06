@@ -10,28 +10,32 @@ Fully automated pipeline that fetches trending Telugu news, generates viral scri
 ## 🔥 What It Does
 
 ```
-Trending News → Gemini AI Script → NotebookLM Video → YouTube Upload → Blog Post
+Trending News → Deep Research → Gemini Script → NotebookLM Video → Thumbnail → YouTube → Blog
 ```
 
 1. **Scouts 7 RSS feeds** — Telugu local, AP/Telangana, crime, Tollywood, tech/AI, sports, trending India
-2. **Viral scoring** — Gemini AI rates each story (1-10) on shock value, shareability, curiosity gap & Telugu relevance
-3. **Telugu script generation** — 1,000-word deep-dive in Telugu for the highest-scoring story
-4. **NotebookLM video creation** — Pastes script into NotebookLM, generates Audio/Video Overview
-5. **1080p FFmpeg conversion** — Converts audio to high-quality 1080p video with title overlay
-6. **YouTube upload** — Publishes as public with SEO-optimized title, description & tags
-7. **Blog post** — Saves to a dark-themed blog website for browsing all published content
+2. **Smart deduplication** — Filters out already-posted stories by checking against `posts.json`
+3. **Viral scoring** — Gemini AI rates each story (1-10) on shock value, shareability, curiosity gap & Telugu relevance
+4. **Deep research** — Searches multiple keyword variations across Google News, fetches full article text for richer context
+5. **Telugu script generation** — 2,000-3,000 word comprehensive Telugu script using all research
+6. **NotebookLM video creation** — Uploads research + script as source, generates Video Overview
+7. **FFmpeg post-processing** — Trims last 8 seconds (NotebookLM end screen removal)
+8. **AI thumbnail generation** — Opens Gemini in browser (unlimited generations), creates category-aware thumbnail
+9. **YouTube upload** — Publishes as public with SEO-optimized title, description & sanitized tags + custom thumbnail
+10. **Blog post** — Saves to a dark-themed blog website for browsing all published content
 
 ## 📁 Project Structure
 
 ```
-├── bot.js                 # Main automation orchestrator (11-step pipeline)
-├── script_generator.js    # News fetching + Gemini AI script generation
-├── youtube_uploader.js    # OAuth2 YouTube upload with SEO metadata
+├── bot.js                 # Main automation orchestrator (12-step pipeline)
+├── script_generator.js    # News fetching + deep research + Gemini AI script generation
+├── youtube_uploader.js    # OAuth2 YouTube upload with SEO metadata + thumbnail
 ├── server.js              # Express blog server (dark-themed UI)
 ├── scheduler.js           # Cron-based scheduling
 ├── logger.js              # Structured logging (console + file)
 ├── login_helper.js        # One-time Google login helper
 ├── check_models.js        # Gemini API health check
+├── video_upscaler.js      # Video upscaling utilities
 ├── package.json
 ├── .env                   # API keys & config (not committed)
 ├── .gitignore
@@ -78,8 +82,8 @@ LOG_LEVEL=INFO
 # Continuous mode delay (minutes between runs)
 LOOP_DELAY_MINUTES=300
 
-# Video mode: 'audio' (1080p via FFmpeg) or 'video' (NotebookLM native)
-VIDEO_MODE=audio
+# Video mode: 'video' (NotebookLM native, default) or 'audio' (1080p via FFmpeg)
+VIDEO_MODE=video
 
 # Blog server port
 BLOG_PORT=3456
@@ -137,10 +141,19 @@ The built-in blog runs at `http://localhost:3456` and features:
 
 | Mode | Quality | How It Works |
 |------|---------|-------------|
-| `audio` (default) | **1080p** | Audio Overview → FFmpeg converts to 1080p MP4 with title overlay |
-| `video` | Lower | NotebookLM's native Video Overview (auto-generated slideshow) |
+| `video` (default) | **Native** | NotebookLM Video Overview → FFmpeg trims end screen → AI thumbnail |
+| `audio` | **1080p** | Audio Overview → FFmpeg converts to 1080p MP4 with title overlay |
 
 Set via `VIDEO_MODE` in `.env`.
+
+## 🖼️ AI Thumbnail Generation
+
+The bot generates custom YouTube thumbnails using Google Gemini's image generation:
+
+- Opens `gemini.google.com` in the browser using your logged-in session (unlimited generations)
+- Creates category-aware prompts (crime → dark/red, entertainment → glamorous, tech → futuristic, etc.)
+- Downloads the generated image and sets it as the YouTube video thumbnail
+- Falls back gracefully if generation fails
 
 ## 🛡️ Security
 
@@ -166,16 +179,21 @@ Gemini AI picks the **most viral story** based on shock value, Telugu relevance,
 ## 🏗️ Architecture
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌──────────────┐
-│  RSS Feeds  │───▶│  Gemini AI   │───▶│  NotebookLM  │
-│  (7 feeds)  │    │ Viral Score  │    │  Audio/Video │
-└─────────────┘    │ Telugu Script│    │  Generation  │
+┌─────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  RSS Feeds  │───▶│  Gemini AI   │───▶│ Deep Research│───▶│  NotebookLM  │
+│  (7 feeds)  │    │ Viral Score  │    │ Multi-query  │    │  Video Gen   │
+└─────────────┘    │ Topic Select │    │ Article Fetch│    └──────┬───────┘
+                   └──────────────┘    └──────────────┘           │
+                                                           ┌──────▼───────┐
+                   ┌──────────────┐    ┌──────────────┐    │   FFmpeg     │
+                   │   Blog UI    │◀───│   YouTube    │◀───│ Trim + Clean │
+                   │  posts.json  │    │ Upload+Thumb │    └──────────────┘
                    └──────────────┘    └──────┬───────┘
                                               │
-                   ┌──────────────┐    ┌──────▼───────┐
-                   │   Blog UI    │◀───│   YouTube    │
-                   │  posts.json  │    │   Upload     │
-                   └──────────────┘    └──────────────┘
+                                       ┌──────▼───────┐
+                                       │ Gemini Image │
+                                       │  Thumbnail   │
+                                       └──────────────┘
 ```
 
 ## License
