@@ -11,13 +11,24 @@ const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 // Serve downloaded media files
 app.use('/media', express.static(DOWNLOADS_DIR));
 
+function getYouTubeId(url) {
+  try { return new URL(url).searchParams.get('v') || ''; } catch { return ''; }
+}
+
+function loadPosts() {
+  try {
+    if (!fs.existsSync(POSTS_FILE)) return [];
+    const data = JSON.parse(fs.readFileSync(POSTS_FILE, 'utf-8'));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
 // API: get all posts
 app.get('/api/posts', (req, res) => {
   try {
-    const posts = fs.existsSync(POSTS_FILE)
-      ? JSON.parse(fs.readFileSync(POSTS_FILE, 'utf-8'))
-      : [];
-    res.json(posts);
+    res.json(loadPosts());
   } catch (err) {
     res.status(500).json({ error: 'Failed to load posts' });
   }
@@ -26,9 +37,7 @@ app.get('/api/posts', (req, res) => {
 // API: get single post
 app.get('/api/posts/:id', (req, res) => {
   try {
-    const posts = fs.existsSync(POSTS_FILE)
-      ? JSON.parse(fs.readFileSync(POSTS_FILE, 'utf-8'))
-      : [];
+    const posts = loadPosts();
     const post = posts.find(p => String(p.id) === req.params.id);
     if (!post) return res.status(404).json({ error: 'Post not found' });
     res.json(post);
@@ -39,9 +48,7 @@ app.get('/api/posts/:id', (req, res) => {
 
 // Main blog page
 app.get('/', (req, res) => {
-  const posts = fs.existsSync(POSTS_FILE)
-    ? JSON.parse(fs.readFileSync(POSTS_FILE, 'utf-8'))
-    : [];
+  const posts = loadPosts();
 
   const postCards = posts.length === 0
     ? '<div class="empty">No posts yet. Run <code>npm run loop</code> to start generating content!</div>'
@@ -51,7 +58,7 @@ app.get('/', (req, res) => {
         });
         const categoryClass = (post.category || 'general').toLowerCase();
         const youtubeEmbed = post.youtubeUrl
-          ? `<div class="video-embed"><iframe src="https://www.youtube.com/embed/${post.youtubeUrl.split('v=')[1]}" frameborder="0" allowfullscreen></iframe></div>`
+          ? `<div class="video-embed"><iframe src="https://www.youtube.com/embed/${getYouTubeId(post.youtubeUrl)}" frameborder="0" allowfullscreen></iframe></div>`
           : (post.videoFile ? `<div class="video-embed"><video controls src="/media/${encodeURIComponent(post.videoFile)}"></video></div>` : '');
         const viralBadge = post.viral_score
           ? `<span class="viral-badge" title="Viral Score">${post.viral_score}/10</span>`
@@ -80,9 +87,7 @@ app.get('/', (req, res) => {
 
 // Single post page
 app.get('/post/:id', (req, res) => {
-  const posts = fs.existsSync(POSTS_FILE)
-    ? JSON.parse(fs.readFileSync(POSTS_FILE, 'utf-8'))
-    : [];
+  const posts = loadPosts();
   const post = posts.find(p => String(p.id) === req.params.id);
   if (!post) return res.status(404).send(blogTemplate('Not Found', '<div class="empty">Post not found.</div>', 0));
 
@@ -90,7 +95,7 @@ app.get('/post/:id', (req, res) => {
     year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit'
   });
   const youtubeEmbed = post.youtubeUrl
-    ? `<div class="video-embed large"><iframe src="https://www.youtube.com/embed/${post.youtubeUrl.split('v=')[1]}" frameborder="0" allowfullscreen></iframe></div>`
+    ? `<div class="video-embed large"><iframe src="https://www.youtube.com/embed/${getYouTubeId(post.youtubeUrl)}" frameborder="0" allowfullscreen></iframe></div>`
     : (post.videoFile ? `<div class="video-embed large"><video controls src="/media/${encodeURIComponent(post.videoFile)}"></video></div>` : '');
   const tags = (post.tags || []).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('');
   const scriptHtml = escapeHtml(post.script || '').replace(/\n/g, '<br>');

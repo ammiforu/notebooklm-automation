@@ -185,15 +185,25 @@ async function generateVideoOverview(page, context) {
     .or(activePage.getByText('Download')).first();
   await downloadLink.waitFor({ state: 'visible', timeout: 5000 });
 
-  const dlPromise = activePage.waitForEvent('download');
-  await downloadLink.click();
-  const download = await dlPromise;
+  let download;
+  try {
+    const dlPromise = activePage.waitForEvent('download', { timeout: 120000 });
+    await downloadLink.click();
+    download = await dlPromise;
+  } catch (dlErr) {
+    throw new Error(`Video download failed or timed out: ${dlErr.message}`);
+  }
 
   const suggestedName = download.suggestedFilename() || `telugu_news_${Date.now()}.mp4`;
   const dlPath = path.join(__dirname, 'downloads', suggestedName);
   fs.mkdirSync(path.join(__dirname, 'downloads'), { recursive: true });
   await download.saveAs(dlPath);
-  log.success(`Video saved to: ${dlPath}`);
+
+  // Validate downloaded file
+  if (!fs.existsSync(dlPath) || fs.statSync(dlPath).size < 10000) {
+    throw new Error(`Downloaded file is missing or too small: ${dlPath}`);
+  }
+  log.success(`Video saved to: ${dlPath} (${Math.round(fs.statSync(dlPath).size / 1024)}KB)`);
   return dlPath;
 }
 
@@ -772,10 +782,11 @@ async function runAutomation() {
       log.info('YouTube credentials not configured. Skipping upload.');
     }
 
-    // 11. Save post to blog database
+    // 11. Save post to blog database (atomic write)
     log.step(11, 'Saving post to blog...');
     try {
       const postsFile = path.join(__dirname, 'posts.json');
+      const tempFile = postsFile + '.tmp';
       const posts = fs.existsSync(postsFile) ? JSON.parse(fs.readFileSync(postsFile, 'utf-8')) : [];
       posts.unshift({
         id: Date.now(),
@@ -791,10 +802,14 @@ async function runAutomation() {
         videoFile: downloadPath ? path.basename(downloadPath) : null,
         mode: VIDEO_MODE,
       });
-      fs.writeFileSync(postsFile, JSON.stringify(posts, null, 2));
+      // Write to temp file first, then rename (atomic)
+      fs.writeFileSync(tempFile, JSON.stringify(posts, null, 2));
+      JSON.parse(fs.readFileSync(tempFile, 'utf-8')); // validate before replacing
+      fs.renameSync(tempFile, postsFile);
       log.success('Post saved to blog database.');
     } catch (postErr) {
       log.warn('Could not save post to blog:', postErr.message);
+      try { fs.unlinkSync(path.join(__dirname, 'posts.json.tmp')); } catch (_) {}
     }
 
     // 12. SEO Output
@@ -807,14 +822,21 @@ async function runAutomation() {
   } catch (err) {
     log.error('Automation Error:', err.message);
     try {
-      await page.screenshot({ path: 'error_screenshot.png' });
+      if (page && !page.isClosed()) {
+        await page.screenshot({ path: 'error_screenshot.png' });
+      }
     } catch (_) {
       log.warn('Could not save error screenshot (page may be closed).');
     }
+    throw err; // Re-throw so continuous mode can track failures
   } finally {
-    try {
-      await context.close();
-    } catch (_) {}
+    if (context) {
+      try {
+        await context.close();
+      } catch (closeErr) {
+        log.warn(`Browser cleanup: ${closeErr.message}`);
+      }
+    }
   }
 }
 
@@ -826,13 +848,22 @@ async function main() {
   if (CONTINUOUS) {
     log.info(`=== CONTINUOUS MODE: Running every ${LOOP_DELAY_MS / 60000} minutes ===`);
     let runCount = 0;
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 5;
     while (true) {
       runCount++;
       log.info(`\n========== RUN #${runCount} started at ${new Date().toLocaleString()} ==========\n`);
       try {
         await runAutomation();
+        consecutiveErrors = 0; // Reset on success
       } catch (err) {
-        log.error(`Run #${runCount} failed:`, err.message);
+        consecutiveErrors++;
+        log.error(`Run #${runCount} failed (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`, err.message);
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          log.error(`CRITICAL: ${MAX_CONSECUTIVE_ERRORS} consecutive failures. Shutting down to prevent resource waste.`);
+          log.error('Fix the issue and restart the bot.');
+          process.exit(1);
+        }
       }
       log.info(`Run #${runCount} complete. Next run in ${LOOP_DELAY_MS / 60000} minutes...`);
       await new Promise(r => setTimeout(r, LOOP_DELAY_MS));

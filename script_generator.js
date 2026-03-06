@@ -28,10 +28,13 @@ const NEWS_FEEDS = [
 async function getTrendingTeluguNews() {
   log.info('Fetching trending news across all categories...');
   const allArticles = [];
+  let feedsSucceeded = 0;
+  let feedsFailed = 0;
   
   for (const feedUrl of NEWS_FEEDS) {
     try {
       const feed = await parser.parseURL(feedUrl);
+      feedsSucceeded++;
       const articles = feed.items.slice(0, 5).map(item => ({
         title: item.title,
         link: item.link,
@@ -44,8 +47,17 @@ async function getTrendingTeluguNews() {
       }));
       allArticles.push(...articles);
     } catch (error) {
+      feedsFailed++;
       log.warn(`Failed to fetch feed: ${error.message}`);
     }
+  }
+
+  // If most feeds failed, this is likely a network issue — don't silently skip
+  if (feedsFailed > 0) {
+    log.info(`Feed results: ${feedsSucceeded} succeeded, ${feedsFailed} failed out of ${NEWS_FEEDS.length}`);
+  }
+  if (feedsFailed > NEWS_FEEDS.length / 2 && allArticles.length === 0) {
+    throw new Error(`Network issue: ${feedsFailed}/${NEWS_FEEDS.length} feeds failed. Check internet connection.`);
   }
   
   // Deduplicate by title similarity (within current batch)
@@ -106,7 +118,10 @@ async function generateTeluguScript(newsList) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await model.generateContent(selectionPrompt);
-      let text = res.response.text().trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      if (!res.response) throw new Error('No response from Gemini');
+      let text = res.response.text();
+      if (!text) throw new Error('Empty response text from Gemini');
+      text = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
       selection = JSON.parse(text);
       if (!selection.selected_news) throw new Error('Missing selected_news');
       break;
@@ -178,12 +193,18 @@ async function generateTeluguScript(newsList) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const result = await model.generateContent(scriptPrompt);
-      let text = result.response.text().trim();
+      if (!result.response) throw new Error('No response from Gemini');
+      let text = result.response.text();
+      if (!text) throw new Error('Empty response text from Gemini');
+      text = text.trim();
       text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
       const parsed = JSON.parse(text);
 
       if (!parsed.script || !parsed.seo) {
         throw new Error("Response missing required fields (script, seo)");
+      }
+      if (parsed.script.length < 500) {
+        throw new Error(`Script too short (${parsed.script.length} chars) — may be incomplete`);
       }
 
       // Attach the research document for NotebookLM

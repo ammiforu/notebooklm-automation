@@ -34,12 +34,23 @@ async function getAuthClient() {
     const token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf-8'));
     oauth2Client.setCredentials(token);
 
-    // Refresh if expired
+    // Refresh if expired (with retry for network hiccups)
     if (token.expiry_date && token.expiry_date < Date.now()) {
       log.info('Refreshing YouTube access token...');
-      const { credentials } = await oauth2Client.refreshAccessToken();
-      oauth2Client.setCredentials(credentials);
-      fs.writeFileSync(TOKEN_PATH, JSON.stringify(credentials, null, 2));
+      let refreshed = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const { credentials } = await oauth2Client.refreshAccessToken();
+          oauth2Client.setCredentials(credentials);
+          fs.writeFileSync(TOKEN_PATH, JSON.stringify(credentials, null, 2));
+          refreshed = true;
+          break;
+        } catch (refreshErr) {
+          log.warn(`Token refresh attempt ${attempt}/3 failed: ${refreshErr.message}`);
+          if (attempt < 3) await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
+        }
+      }
+      if (!refreshed) throw new Error('Failed to refresh YouTube token after 3 attempts');
     }
     return oauth2Client;
   }
@@ -53,11 +64,17 @@ async function getAuthClient() {
   log.info('No YouTube token found. Authorize this app by visiting:');
   console.log('\n' + authUrl + '\n');
 
-  // Read auth code from stdin
-  const code = await new Promise((resolve) => {
+  // Read auth code from stdin (with timeout for headless/service environments)
+  const code = await new Promise((resolve, reject) => {
+    if (!process.stdin.isTTY) {
+      reject(new Error('No TTY available for auth. Run "npm run login" manually first to authorize YouTube.'));
+      return;
+    }
     const readline = require('readline');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const timeout = setTimeout(() => { rl.close(); reject(new Error('Auth code input timed out after 5 minutes')); }, 300000);
     rl.question('Enter the authorization code: ', (answer) => {
+      clearTimeout(timeout);
       rl.close();
       resolve(answer.trim());
     });
@@ -138,8 +155,9 @@ async function setThumbnail(videoUrl, thumbnailPath) {
     throw new Error(`Thumbnail file not found: ${thumbnailPath}`);
   }
 
-  const videoId = videoUrl.split('v=')[1];
-  if (!videoId) throw new Error('Could not extract video ID from URL');
+  const urlObj = new URL(videoUrl);
+  const videoId = urlObj.searchParams.get('v');
+  if (!videoId) throw new Error(`Could not extract video ID from URL: ${videoUrl}`);
 
   log.info(`Setting thumbnail for video ${videoId}...`);
   const auth = await getAuthClient();
