@@ -4,16 +4,15 @@ const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { getTrendingTeluguNews, generateTeluguScript } = require('./script_generator');
-const { uploadToYouTube } = require('./youtube_uploader');
+const { uploadToYouTube, setThumbnail } = require('./youtube_uploader');
 const log = require('./logger');
 require('dotenv').config();
 
 chromium.use(stealth());
 
 const NOTEBOOKLM_URL = 'https://notebooklm.google.com/';
-// 'video' = NotebookLM Video Overview (lower quality, auto-generated)
-// 'audio' = NotebookLM Audio Overview + FFmpeg conversion to 1080p video
-const VIDEO_MODE = process.env.VIDEO_MODE || 'audio';
+const FFMPEG = require('ffmpeg-static');
+const VIDEO_MODE = process.env.VIDEO_MODE || 'video';
 
 /**
  * Delete old notebooks from the dashboard to avoid clutter.
@@ -66,6 +65,15 @@ async function cleanupOldNotebooks(page, keepCount = 1) {
 // ==================== VIDEO OVERVIEW HELPER ====================
 async function generateVideoOverview(page, context) {
   log.step(7, 'Triggering Video Overview generation...');
+
+  // Dismiss any leftover CDK overlays/dialogs that might block clicks
+  try {
+    const backdrop = page.locator('.cdk-overlay-backdrop-showing');
+    if (await backdrop.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(500);
+    }
+  } catch (_) {}
 
   const videoOverviewLink = page.locator('text="Video Overview"').first();
   await videoOverviewLink.waitFor({ state: 'visible', timeout: 30000 });
@@ -187,6 +195,239 @@ async function generateVideoOverview(page, context) {
   await download.saveAs(dlPath);
   log.success(`Video saved to: ${dlPath}`);
   return dlPath;
+}
+
+// ==================== POST-PROCESS VIDEO (trim end screen + remove watermark) ====================
+function postProcessVideo(inputPath) {
+  log.info('Post-processing video: removing watermark & end screen...');
+  const dir = path.dirname(inputPath);
+  const ext = path.extname(inputPath);
+  const base = path.basename(inputPath, ext);
+  const outputPath = path.join(dir, `${base}_clean${ext}`);
+
+  // Get duration
+  let duration;
+  try {
+    const probe = execFileSync(FFMPEG, [
+      '-i', inputPath, '-f', 'null', '-'
+    ], { timeout: 30000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+  } catch (e) {
+    // ffmpeg prints info to stderr even on success
+    const match = (e.stderr || e.message || '').match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
+    if (match) {
+      duration = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3]);
+    }
+  }
+
+  // Trim last 8 seconds (NotebookLM end screen) and use delogo to blur the watermark area
+  // Watermark is typically in the bottom-right corner
+  const trimEnd = duration ? duration - 8 : null;
+  const args = ['-y', '-i', inputPath];
+
+  if (trimEnd && trimEnd > 10) {
+    args.push('-t', String(trimEnd));
+  }
+
+  // Just trim the end screen (last 8 seconds) — skip delogo as it's unreliable across ffmpeg versions
+  args.push(
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+    '-c:a', 'copy',
+    outputPath
+  );
+
+  try {
+    execFileSync(FFMPEG, args, { timeout: 300000 });
+    log.success(`Cleaned video saved to: ${outputPath}`);
+    return outputPath;
+  } catch (err) {
+    log.warn(`Post-processing failed: ${err.message}. Using original video.`);
+    return inputPath;
+  }
+}
+
+// ==================== THUMBNAIL GENERATION VIA GEMINI BROWSER ====================
+async function generateThumbnailWithGemini(browserContext, title, category, selectedNews) {
+  log.info('Generating thumbnail via Gemini in browser...');
+
+  const thumbDir = path.join(__dirname, 'downloads');
+  fs.mkdirSync(thumbDir, { recursive: true });
+  const thumbPath = path.join(thumbDir, `thumbnail_${Date.now()}.png`);
+
+  // Build a compelling thumbnail prompt
+  const categoryStyle = {
+    crime: 'dark dramatic background, red warning colors, police lights, sense of danger',
+    entertainment: 'colorful glamorous background, movie poster style, star-studded, bright lights',
+    tech: 'futuristic digital background, blue and purple neon, circuit board pattern, modern tech',
+    sports: 'stadium background, action shot, green field, dynamic motion blur',
+    politics: 'government building background, formal setting, national flag colors, serious tone',
+    local: 'Indian city background, local streets, vibrant colors, community feel',
+  };
+  const style = categoryStyle[category] || 'dramatic news studio background, bold colors, professional';
+
+  const prompt = `Generate a photorealistic YouTube thumbnail image (16:9 aspect ratio, 1280x720).
+Topic: ${selectedNews || title}
+Style: ${style}
+Requirements:
+- Eye-catching and dramatic, designed to maximize clicks
+- Bold visual composition with high contrast
+- NO TEXT or letters on the image at all
+- Professional YouTube thumbnail quality
+- Emotional and attention-grabbing visual that represents the news topic
+- Vivid saturated colors`;
+
+  const geminiPage = await browserContext.newPage();
+  try {
+    await geminiPage.goto('https://gemini.google.com/app', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await geminiPage.waitForTimeout(3000);
+
+    // Wait for the chat input to be ready
+    const inputSelector = [
+      '.ql-editor[contenteditable="true"]',
+      'div[contenteditable="true"][role="textbox"]',
+      'rich-textarea div[contenteditable="true"]',
+      'textarea',
+      '[aria-label*="Enter" i][contenteditable="true"]',
+      'div.input-area [contenteditable="true"]',
+    ].join(', ');
+
+    const inputBox = geminiPage.locator(inputSelector).first();
+    await inputBox.waitFor({ state: 'visible', timeout: 30000 });
+    log.info('Gemini chat input found. Typing thumbnail prompt...');
+
+    // Click to focus and type the prompt
+    await inputBox.click();
+    await geminiPage.waitForTimeout(500);
+    await inputBox.fill(prompt);
+    await geminiPage.waitForTimeout(500);
+
+    // Click Send button
+    const sendBtn = geminiPage.locator([
+      'button[aria-label*="Send" i]',
+      'button[aria-label*="Submit" i]',
+      'button.send-button',
+      'button[mattooltip*="Send" i]',
+      'button:has(mat-icon:text("send"))',
+      'button:has(span:text("send"))',
+    ].join(', ')).first();
+    await sendBtn.waitFor({ state: 'visible', timeout: 10000 });
+    await sendBtn.click();
+    log.info('Prompt sent. Waiting for image generation...');
+
+    // Wait for image to appear in the response (up to 3 minutes)
+    const imageSelector = [
+      '.response-container img[src*="blob:"]',
+      '.response-container img[src*="data:"]',
+      '.model-response-text img',
+      'message-content img',
+      '.response img',
+      'img.generated-image',
+      '.image-container img',
+      'img[alt*="Generated" i]',
+      '.response-container canvas',
+    ].join(', ');
+
+    const maxWaitMs = 180000;
+    const pollMs = 5000;
+    const startTime = Date.now();
+    let imageFound = false;
+    let imageElement = null;
+
+    while (Date.now() - startTime < maxWaitMs) {
+      // Check for generated images in the response
+      const images = geminiPage.locator(imageSelector);
+      const count = await images.count().catch(() => 0);
+      if (count > 0) {
+        imageElement = images.first();
+        const src = await imageElement.getAttribute('src').catch(() => '');
+        if (src && src.length > 10) {
+          imageFound = true;
+          break;
+        }
+      }
+
+      // Also check for any img inside the latest response turn
+      const turnImages = geminiPage.locator('.conversation-turn:last-child img, .model-response:last-child img, [data-turn-role="model"] img');
+      const turnCount = await turnImages.count().catch(() => 0);
+      if (turnCount > 0) {
+        imageElement = turnImages.first();
+        const src = await imageElement.getAttribute('src').catch(() => '');
+        if (src && src.length > 10) {
+          imageFound = true;
+          break;
+        }
+      }
+
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      log.info(`Waiting for Gemini image... (${elapsed}s elapsed)`);
+      await geminiPage.waitForTimeout(pollMs);
+    }
+
+    if (!imageFound || !imageElement) {
+      log.warn('Gemini image generation timed out or no image found.');
+      return null;
+    }
+
+    log.success('Image generated! Downloading...');
+
+    // Try to download via right-click context menu or direct src
+    // First attempt: get the image src and download it
+    const src = await imageElement.getAttribute('src').catch(() => '');
+
+    if (src && src.startsWith('data:')) {
+      // data URI — extract base64
+      const base64Match = src.match(/base64,(.+)/);
+      if (base64Match) {
+        const buffer = Buffer.from(base64Match[1], 'base64');
+        fs.writeFileSync(thumbPath, buffer);
+        log.success(`Thumbnail saved: ${thumbPath} (${Math.round(buffer.length / 1024)}KB)`);
+        return thumbPath;
+      }
+    }
+
+    if (src && (src.startsWith('blob:') || src.startsWith('http'))) {
+      // Use page.evaluate to fetch the image as a blob and convert to base64
+      const base64Data = await geminiPage.evaluate(async (imgSrc) => {
+        try {
+          const resp = await fetch(imgSrc);
+          const blob = await resp.blob();
+          return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.readAsDataURL(blob);
+          });
+        } catch {
+          return null;
+        }
+      }, src);
+
+      if (base64Data) {
+        const base64Match = base64Data.match(/base64,(.+)/);
+        if (base64Match) {
+          const buffer = Buffer.from(base64Match[1], 'base64');
+          fs.writeFileSync(thumbPath, buffer);
+          log.success(`Thumbnail saved: ${thumbPath} (${Math.round(buffer.length / 1024)}KB)`);
+          return thumbPath;
+        }
+      }
+    }
+
+    // Fallback: screenshot the image element
+    log.info('Falling back to screenshot of generated image...');
+    await imageElement.screenshot({ path: thumbPath });
+    const stat = fs.statSync(thumbPath);
+    if (stat.size > 5000) {
+      log.success(`Thumbnail saved via screenshot: ${thumbPath} (${Math.round(stat.size / 1024)}KB)`);
+      return thumbPath;
+    }
+
+    log.warn('Screenshot too small, thumbnail may be invalid.');
+    return null;
+  } catch (err) {
+    log.warn(`Gemini browser thumbnail failed: ${err.message}`);
+    return null;
+  } finally {
+    await geminiPage.close().catch(() => {});
+  }
 }
 
 // ==================== AUDIO OVERVIEW + FFMPEG HELPER ====================
@@ -316,6 +557,70 @@ async function generateAudioOverviewAndConvert(page, context, data) {
   return videoPath;
 }
 
+// ==================== ADD SOURCE TO NOTEBOOK HELPER ====================
+async function addSourceToNotebook(page, title, content) {
+  // Open the "Add sources" dialog
+  try {
+    if (await page.isVisible('text="Add sources"')) {
+      await page.click('text="Add sources"');
+    } else {
+      // After first source, the button becomes a "+" icon
+      const plusButton = page.locator('button:has([alt="Add sources"]), button:has-text("+"), button[aria-label*="source" i]').first();
+      if (await plusButton.isVisible()) {
+        await plusButton.click();
+      }
+    }
+  } catch (_) {}
+
+  await page.click('text="Copied text"');
+
+  // Target the actual mat-dialog-container (avoid emoji keyboard [role="dialog"])
+  const modal = page.locator('mat-dialog-container').last();
+  await modal.waitFor({ state: 'visible', timeout: 10000 });
+
+  const textareas = modal.locator('textarea');
+  const count = await textareas.count();
+
+  if (count >= 2) {
+    log.info(`Filling title and content in modal (Found ${count} textareas)...`);
+    await textareas.nth(0).fill(title);
+    await textareas.nth(1).click();
+    await textareas.nth(1).fill(content);
+  } else if (count === 1) {
+    log.info(`Filling content in modal (Found 1 textarea)...`);
+    await textareas.first().click();
+    await textareas.first().fill(content);
+  } else {
+    const enabledTextareas = page.locator('textarea:not([disabled])');
+    if (await enabledTextareas.count() > 0) {
+      await enabledTextareas.first().fill(content);
+    } else {
+      throw new Error('Could not find an enabled textarea to paste source.');
+    }
+  }
+
+  // Force input event to enable Insert button
+  await page.keyboard.press('Space');
+
+  const insertBtn = modal.locator('button:has-text("Insert")');
+  await insertBtn.waitFor({ state: 'visible' });
+
+  log.info("Waiting for 'Insert' button to be enabled...");
+  try {
+    await page.waitForFunction(() => {
+      const el = Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes("Insert"));
+      return el && !el.disabled && !el.getAttribute('disabled');
+    }, { timeout: 15000 });
+  } catch (_) {
+    log.warn('Insert button still disabled, trying force click...');
+  }
+
+  await insertBtn.click({ force: true });
+  await insertBtn.waitFor({ state: 'hidden', timeout: 15000 });
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForTimeout(2000); // Brief pause for source processing to start
+}
+
 async function runAutomation() {
   const userDataDir = path.join(__dirname, 'user_data');
   const outputFilePath = path.join(__dirname, 'daily_output.json');
@@ -326,10 +631,14 @@ async function runAutomation() {
   try {
     const news = await getTrendingTeluguNews();
     if (news.length === 0) {
-      log.error('No news found. Exiting.');
+      log.info('No new news to cover — all articles already posted. Skipping this run.');
       return;
     }
     data = await generateTeluguScript(news);
+    if (data.viral_score && data.viral_score < 5) {
+      log.info(`Viral score too low (${data.viral_score}/10). Skipping video generation.`);
+      return;
+    }
     fs.writeFileSync(outputFilePath, JSON.stringify(data, null, 2));
     log.success('Script generated and saved.');
   } catch (genErr) {
@@ -386,69 +695,16 @@ async function runAutomation() {
       timeout: 15000,
     });
 
-    // 5. Upload the Script as a Source
-    log.step(5, 'Uploading script content...');
-    try {
-      if (await page.isVisible('text="Add sources"')) {
-        await page.click('text="Add sources"');
-      } else {
-        const plusButton = page.locator('button:has([alt="Add sources"]), button:has-text("+")');
-        if (await plusButton.isVisible()) {
-          await plusButton.click();
-        }
-      }
-    } catch (e) {}
+    // 5. Upload research + script as sources to NotebookLM
+    log.step(5, 'Uploading source content to NotebookLM...');
 
-    await page.click('text="Copied text"'); 
-    
-    // Target textareas inside the modal/dialog
-    const modal = page.locator('mat-dialog-container, [role="dialog"]');
-    await modal.waitFor({ state: 'visible', timeout: 10000 });
-    
-    const textareas = modal.locator('textarea');
-    const count = await textareas.count();
-    
-    if (count >= 2) {
-      log.info(`Filling title and content in modal (Found ${count} textareas)...`);
-      await textareas.nth(0).fill(`Telugu AI News - ${new Date().toLocaleDateString()}`);
-      await textareas.nth(1).click();
-      await textareas.nth(1).fill(data.script);
-    } else if (count === 1) {
-      log.info('Filling content in modal (Found 1 textarea)...');
-      await textareas.first().click();
-      await textareas.first().fill(data.script);
-    } else {
-      log.warn('No textareas found in modal, trying global enabled textareas...');
-      const enabledTextareas = page.locator('textarea:not([disabled])');
-      if (await enabledTextareas.count() > 0) {
-        await enabledTextareas.first().fill(data.script);
-      } else {
-        throw new Error('Could not find an enabled textarea to paste the script.');
-      }
-    }
+    // Build a comprehensive source document from research + script (single source is more reliable)
+    const sourceContent = data.research
+      ? `${data.research}\n\n=== TELUGU SCRIPT ===\n${data.script}`
+      : data.script;
 
-    // Force an input event to ensure the "Insert" button enables
-    await page.keyboard.press('Space');
-
-    // Wait for the Insert button to become enabled (event-based, not timeout)
-    const insertBtn = modal.locator('button:has-text("Insert")');
-    await insertBtn.waitFor({ state: 'visible' });
-    
-    log.info("Waiting for 'Insert' button to be enabled...");
-    try {
-      await page.waitForFunction(() => {
-        const el = Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes("Insert"));
-        return el && !el.disabled && !el.getAttribute('disabled');
-      }, { timeout: 15000 });
-    } catch (e) {
-      log.warn('Button still disabled after wait, trying force click...');
-    }
-
-    await insertBtn.click({ force: true });
-    
-    // Wait for the modal to close
-    await insertBtn.waitFor({ state: 'hidden', timeout: 15000 });
-    log.success('Script inserted successfully.');
+    await addSourceToNotebook(page, 'Research & Script', sourceContent);
+    log.success('Source inserted successfully.');
 
     // Wait for the source to be processed (don't use networkidle — NotebookLM keeps connections open)
     await page.waitForLoadState('domcontentloaded');
@@ -467,22 +723,47 @@ async function runAutomation() {
     let downloadPath;
 
     if (VIDEO_MODE === 'video') {
-      // ==================== VIDEO MODE ====================
-      // Use NotebookLM's built-in Video Overview (lower resolution)
       downloadPath = await generateVideoOverview(page, context);
     } else {
-      // ==================== AUDIO MODE (default) ====================
-      // Higher quality: Audio Overview → FFmpeg 1080p conversion
       downloadPath = await generateAudioOverviewAndConvert(page, context, data);
     }
 
-    // 9. YouTube Upload
+    // 8b. Post-process: remove watermark & end screen
+    log.step('8b', 'Post-processing video (removing watermark & end screen)...');
+    downloadPath = postProcessVideo(downloadPath);
+
+    // 9. Generate thumbnail with Gemini Image API
+    log.step(9, 'Generating YouTube thumbnail with Gemini...');
+    let thumbnailPath = null;
+    try {
+      thumbnailPath = await generateThumbnailWithGemini(
+        context,
+        data.seo.title,
+        data.category,
+        data.selected_news
+      );
+    } catch (thumbErr) {
+      log.warn('Thumbnail generation failed:', thumbErr.message);
+    }
+
+    // 10. YouTube Upload
     let videoUrl = null;
     if (process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET) {
-      log.step(9, 'Uploading to YouTube...');
+      log.step(10, 'Uploading to YouTube...');
       try {
         videoUrl = await uploadToYouTube(downloadPath, data.seo);
         log.success(`YouTube upload complete: ${videoUrl}`);
+
+        // Set custom thumbnail if generated
+        if (thumbnailPath && videoUrl) {
+          log.info('Setting custom thumbnail on YouTube video...');
+          try {
+            await setThumbnail(videoUrl, thumbnailPath);
+            log.success('Custom thumbnail set!');
+          } catch (thumbSetErr) {
+            log.warn('Could not set thumbnail:', thumbSetErr.message);
+          }
+        }
       } catch (uploadErr) {
         log.error('YouTube upload failed:', uploadErr.message);
         log.info('You can manually upload later: node youtube_uploader.js ' + downloadPath);
@@ -491,8 +772,8 @@ async function runAutomation() {
       log.info('YouTube credentials not configured. Skipping upload.');
     }
 
-    // 10. Save post to blog database
-    log.step(10, 'Saving post to blog...');
+    // 11. Save post to blog database
+    log.step(11, 'Saving post to blog...');
     try {
       const postsFile = path.join(__dirname, 'posts.json');
       const posts = fs.existsSync(postsFile) ? JSON.parse(fs.readFileSync(postsFile, 'utf-8')) : [];
@@ -516,7 +797,7 @@ async function runAutomation() {
       log.warn('Could not save post to blog:', postErr.message);
     }
 
-    // 11. SEO Output
+    // 12. SEO Output
     log.info('--- YOUTUBE SEO READY ---');
     log.info(`TITLE: ${data.seo.title}`);
     log.info(`DESC: ${data.seo.description}`);

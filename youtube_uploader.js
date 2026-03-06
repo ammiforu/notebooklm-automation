@@ -47,7 +47,7 @@ async function getAuthClient() {
   // First-time setup: user must authorize
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
-    scope: ['https://www.googleapis.com/auth/youtube.upload'],
+    scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube'],
   });
 
   log.info('No YouTube token found. Authorize this app by visiting:');
@@ -88,13 +88,26 @@ async function uploadToYouTube(filePath, seo) {
   log.info(`Uploading: ${path.basename(filePath)}`);
   log.info(`Title: ${seo.title}`);
 
+  // Sanitize tags: strip special chars, keep only safe characters, cap lengths
+  let sanitizedTags = (seo.tags || [])
+    .map(t => t.replace(/[^\w\s\u0C00-\u0C7F\u0900-\u097F.-]/gu, '').replace(/\s+/g, ' ').trim())
+    .filter(t => t.length > 1)
+    .map(t => Buffer.byteLength(t, 'utf8') > 30 ? t.substring(0, 20) : t);
+  // Cap total combined byte length to 450 (YouTube limit ~500 bytes)
+  while (sanitizedTags.length > 0) {
+    const totalBytes = Buffer.byteLength(sanitizedTags.join(','), 'utf8');
+    if (totalBytes <= 450) break;
+    sanitizedTags.pop();
+  }
+  log.info(`Using ${sanitizedTags.length} sanitized tags (${Buffer.byteLength(sanitizedTags.join(','), 'utf8')} bytes)`);
+
   const res = await youtube.videos.insert({
     part: 'snippet,status',
     requestBody: {
       snippet: {
         title: seo.title,
         description: seo.description,
-        tags: seo.tags,
+        tags: sanitizedTags,
         categoryId: '25', // News & Politics
         defaultLanguage: 'te',
         defaultAudioLanguage: 'te',
@@ -113,6 +126,34 @@ async function uploadToYouTube(filePath, seo) {
   log.success(`Upload complete! Video URL: ${videoUrl}`);
   log.info('Video is PUBLIC and live!');
   return videoUrl;
+}
+
+/**
+ * Set a custom thumbnail on a YouTube video.
+ * @param {string} videoUrl - YouTube video URL (contains video ID)
+ * @param {string} thumbnailPath - Path to the thumbnail image file
+ */
+async function setThumbnail(videoUrl, thumbnailPath) {
+  if (!fs.existsSync(thumbnailPath)) {
+    throw new Error(`Thumbnail file not found: ${thumbnailPath}`);
+  }
+
+  const videoId = videoUrl.split('v=')[1];
+  if (!videoId) throw new Error('Could not extract video ID from URL');
+
+  log.info(`Setting thumbnail for video ${videoId}...`);
+  const auth = await getAuthClient();
+  const youtube = google.youtube({ version: 'v3', auth });
+
+  await youtube.thumbnails.set({
+    videoId: videoId,
+    media: {
+      mimeType: 'image/png',
+      body: fs.createReadStream(thumbnailPath),
+    },
+  });
+
+  log.success('Custom thumbnail set successfully!');
 }
 
 // CLI: node youtube_uploader.js <filepath>
@@ -137,4 +178,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { uploadToYouTube, getAuthClient };
+module.exports = { uploadToYouTube, setThumbnail, getAuthClient };
