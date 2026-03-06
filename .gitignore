@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+youtube_token.json
+
+# Dependencies
+node_modules/
+
+# Chrome user data (contains cookies, passwords, session tokens)
+user_data/
+
+# Generated output
+daily_output.json
+posts.json
+downloads/
+automation.log
+
+# Debug screenshots
+*.png
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

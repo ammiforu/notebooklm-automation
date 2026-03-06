@@ -1,0 +1,32 @@
+{
+  "name": "notebooklm-automation",
+  "version": "1.0.0",
+  "description": "",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "loop": "node bot.js --loop",
+    "blog": "node server.js",
+    "service": "node bot.js --loop & node server.js",
+    "login": "node login_helper.js",
+    "generate": "node script_generator.js",
+    "check": "node check_models.js",
+    "upload": "node youtube_uploader.js",
+    "schedule": "node scheduler.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "cron": "^3.1.0",
+    "dotenv": "^17.3.1",
+    "express": "^4.22.1",
+    "googleapis": "^144.0.0",
+    "playwright": "^1.58.2",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "rss-parser": "^3.13.0"
+  }
+}
