@@ -274,16 +274,7 @@ async function generateThumbnailWithGemini(browserContext, title, category, sele
   };
   const style = categoryStyle[category] || 'dramatic news studio background, bold colors, professional';
 
-  const prompt = `Generate a photorealistic YouTube thumbnail image (16:9 aspect ratio, 1280x720).
-Topic: ${selectedNews || title}
-Style: ${style}
-Requirements:
-- Eye-catching and dramatic, designed to maximize clicks
-- Bold visual composition with high contrast
-- NO TEXT or letters on the image at all
-- Professional YouTube thumbnail quality
-- Emotional and attention-grabbing visual that represents the news topic
-- Vivid saturated colors`;
+  const prompt = `Generate a photorealistic YouTube thumbnail image (16:9 aspect ratio, 1280x720). Topic: ${selectedNews || title}. Style: ${style}. Requirements: Eye-catching and dramatic, designed to maximize clicks. Bold visual composition with high contrast. NO TEXT or letters on the image at all. Professional YouTube thumbnail quality. Emotional and attention-grabbing visual that represents the news topic. Vivid saturated colors.`;
 
   const geminiPage = await browserContext.newPage();
   try {
@@ -310,17 +301,8 @@ Requirements:
     await inputBox.fill(prompt);
     await geminiPage.waitForTimeout(500);
 
-    // Click Send button
-    const sendBtn = geminiPage.locator([
-      'button[aria-label*="Send" i]',
-      'button[aria-label*="Submit" i]',
-      'button.send-button',
-      'button[mattooltip*="Send" i]',
-      'button:has(mat-icon:text("send"))',
-      'button:has(span:text("send"))',
-    ].join(', ')).first();
-    await sendBtn.waitFor({ state: 'visible', timeout: 10000 });
-    await sendBtn.click();
+    // Submit the prompt by pressing Enter
+    await geminiPage.keyboard.press('Enter');
     log.info('Prompt sent. Waiting for image generation...');
 
     // Wait for image to appear in the response (up to 3 minutes)
